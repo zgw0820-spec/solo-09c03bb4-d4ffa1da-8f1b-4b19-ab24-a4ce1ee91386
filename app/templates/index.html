@@ -34,6 +34,13 @@
   .panel.bad-panel { border-color: var(--bad); background: #fff5f5; }
   ul { margin: 6px 0; padding-left: 20px; }
   code { background: #eff1f3; padding: 1px 4px; border-radius: 4px; }
+  .pbar { background: #eaeef2; border-radius: 6px; height: 14px; overflow: hidden; margin: 8px 0; }
+  .pbar > i { display: block; height: 100%; background: #1f6feb; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 12px; }
+  .tag.run { background: #fff8c5; color: #7d4e00; }
+  .tag.done { background: #dafbe1; color: var(--ok); }
+  .tag.fail { background: #ffebe9; color: var(--bad); }
+  details { margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -42,6 +49,42 @@
   <div class="vol" id="vol-info">尚未盘点</div>
 </header>
 <main>
+  <section>
+    <h2>应急储备（日志卷写满、轮转受阻时释放，每份实占 8 MiB 数据块，上限 16 份）</h2>
+    <div class="bar">
+      <span>已备 <b id="rs-ready">-</b>/16 份（<span id="rs-bytes"></span>）</span>
+      <span class="muted">暂存中 <b id="rs-staging">0</b> 份（未生效）</span>
+      <span class="muted">卷可用 <span id="rs-free">-</span></span>
+    </div>
+    <div class="pbar"><i id="rs-bar" style="width:0%"></i></div>
+    <div class="bar">
+      <span>补回 <input id="rs-replenish-n" type="number" min="1" max="16" step="1" value="2"> 份</span>
+      <button id="btn-replenish">申请补回</button>
+      <span>释放
+        <button class="ghost" data-release="1">1 份</button>
+        <button class="ghost" data-release="2">2 份</button>
+        <button class="ghost" data-release="all">全部</button>
+      </span>
+      <span class="muted">补回先暂存、凑齐整批生效；分配期间仍可释放已有储备</span>
+    </div>
+    <table id="rs-jobs">
+      <thead><tr><th>补回任务</th><th>批次</th><th>进度</th><th>状态</th><th>说明</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <table id="rs-batches">
+      <thead><tr><th>已生效批次</th><th>份数</th><th>实占</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="panel" id="rs-result"></div>
+    <details>
+      <summary class="muted">审计事件（释放 / 补回 / 重启清理）</summary>
+      <table id="rs-events">
+        <thead><tr><th>时间</th><th>事件</th><th>详情</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </details>
+  </section>
+
   <section>
     <div class="bar">
       <button id="btn-scan">盘点日志卷</button>
@@ -240,6 +283,81 @@ function updateSelCount(){
 
 document.getElementById('btn-scan').addEventListener('click', doScan);
 document.getElementById('btn-plan').addEventListener('click', doPlan);
+
+// ---------------- 应急储备 ----------------
+let reserveTimer = null;
+
+function showReservePanel(ok, html){
+  const el = document.getElementById('rs-result');
+  el.className = 'panel show ' + (ok ? 'ok-panel' : 'bad-panel');
+  el.innerHTML = html;
+}
+
+function jobTag(state){
+  const map = {pending:['run','排队中'], allocating:['run','分配中'],
+    promoting:['run','整批生效中'], done:['done','已完成'], failed:['fail','已失败回滚']};
+  const [cls, txt] = map[state] || ['run', state];
+  return `<span class="tag ${cls}">${txt}</span>`;
+}
+
+function renderReserve(j){
+  const r = j.reserve;
+  document.getElementById('rs-ready').textContent = r.ready_portions;
+  document.getElementById('rs-bytes').textContent = fmtMiB(r.ready_bytes);
+  document.getElementById('rs-staging').textContent = r.staging_portions;
+  document.getElementById('rs-free').textContent = fmtMiB(r.volume_free_bytes);
+  document.getElementById('rs-bar').style.width =
+    (r.ready_portions / r.max_portions * 100).toFixed(1) + '%';
+  document.querySelector('#rs-batches tbody').innerHTML = r.batches.map(b =>
+    `<tr><td><code>${b.id}</code></td><td>${b.portions}</td><td>${fmtMiB(b.bytes)}</td></tr>`
+  ).join('') || '<tr><td colspan="3" class="muted">暂无已生效批次</td></tr>';
+  document.querySelector('#rs-jobs tbody').innerHTML = r.jobs.map(job =>
+    `<tr><td><code>${job.id}</code></td><td><code>${job.batch_id}</code></td>
+      <td>${job.allocated}/${job.requested} 份</td><td>${jobTag(job.state)}</td>
+      <td>${job.error ? '<span class="bad">'+esc(job.error)+'</span>' : esc(job.started_at + (job.finished_at ? ' → ' + job.finished_at : ''))}</td></tr>`
+  ).join('') || '<tr><td colspan="5" class="muted">还没有补回任务</td></tr>';
+  document.querySelector('#rs-events tbody').innerHTML = (j.events || []).slice().reverse().map(ev =>
+    `<tr><td class="muted">${esc(ev.ts)}</td><td><code>${esc(ev.kind)}</code></td>
+      <td class="muted"><code>${esc(JSON.stringify(ev, Object.keys(ev).filter(k => k!=='ts'&&k!=='kind')))}</code></td></tr>`
+  ).join('') || '<tr><td colspan="3" class="muted">暂无事件</td></tr>';
+  const running = r.jobs.some(job => ['pending','allocating','promoting'].includes(job.state));
+  if (running && !reserveTimer) reserveTimer = setInterval(loadReserve, 700);
+  if (!running && reserveTimer){ clearInterval(reserveTimer); reserveTimer = null; }
+}
+
+async function loadReserve(){
+  try { renderReserve(await api('/api/reserve')); }
+  catch(e){ /* 后台轮询静默，避免打扰值班操作 */ }
+}
+
+async function doReplenish(){
+  const n = parseInt(document.getElementById('rs-replenish-n').value, 10);
+  try {
+    const j = await api('/api/reserve/replenish', {count: n});
+    renderReserve(j);
+    showReservePanel(true, `补回任务 <code>${j.job.id}</code> 已开始：先在暂存目录逐份分配 8 MiB 实占块，凑齐 ${n} 份后整批生效。分配期间可继续释放已有储备。`);
+  } catch(e){
+    showReservePanel(false, '<span class="bad">补回申请失败：</span>' + esc(e.message));
+    loadReserve();
+  }
+}
+
+async function doRelease(ev){
+  const v = ev.target.dataset.release;
+  const body = v === 'all' ? {count: 16} : {count: parseInt(v, 10)};
+  try {
+    const j = await api('/api/reserve/release', body);
+    renderReserve(j);
+    showReservePanel(true, `已释放 <b>${j.released.released}</b> 份，腾出 <b>${fmtMiB(j.released.bytes_freed)}</b>：<code>${j.released.portions.map(esc).join('</code>、<code>')}</code>`);
+  } catch(e){
+    showReservePanel(false, '<span class="bad">释放失败：</span>' + esc(e.message));
+    loadReserve();
+  }
+}
+
+document.getElementById('btn-replenish').addEventListener('click', doReplenish);
+document.querySelectorAll('button[data-release]').forEach(b => b.addEventListener('click', doRelease));
+loadReserve();
 load();
 </script>
 </body>

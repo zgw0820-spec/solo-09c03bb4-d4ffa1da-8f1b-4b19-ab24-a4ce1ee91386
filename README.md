@@ -4,6 +4,10 @@
 本工具用 Flask 提供值班网页，从 `/proc` 盘点单个专用日志卷上的这类文件，
 按进程组给出**达标且重启组数最少**的回收方案，并支持事后复核。
 
+当日志卷写满、日志轮转受阻、来不及重启进程时，值班台还提供一份**应急储备**：
+平时在卷上预留若干份实占 8 MiB 的数据块，紧急时在网页上一键释放腾出空间，
+事后再按份数补回。
+
 ## 快速开始
 
 ```bash
@@ -42,6 +46,65 @@ docker compose up --build
 | GET | `/api/state` | 当前快照与方案列表 |
 | POST | `/api/plan` | `{snapshot_id, groups[], target_bytes}` → 方案 |
 | POST | `/api/review` | `{plan_id}` → 重新盘点并复核 |
+| GET | `/api/reserve` | 应急储备状态与审计事件 |
+| POST | `/api/reserve/replenish` | `{count}` → 申请补回 |
+| POST | `/api/reserve/release` | `{count}` → 释放储备 |
+| GET | `/api/reserve/jobs/<id>` | 补回任务进度 |
+
+## 应急储备
+
+卷写满、轮转受阻时，值班员可在同一网页顶部释放应急储备救急，平时查询余量、
+按份数补回。规则如下：
+
+- **每份实占 8 MiB 磁盘数据块**：用 `posix_fallocate` 保证落盘分配（不支持的
+  文件系统退化为写零），并按 `st_blocks` 复核下限，杜绝稀疏空洞；全卷最多
+  **16 份**，由本单进程服务管理（进程内锁 + 锁文件 `lockf` 排他锁，第二个
+  服务进程会被拒绝启动）。
+- **补回只分配新增份额**：新份先写到 `staging/` 暂存目录，逐份分配、逐份可见
+  进度；**凑齐后整批 `rename` 原子生效**（`ready/` 下一次出现整个批次），
+  不存在"补了一半可用"的状态。分配在锁外逐份进行，**期间已有储备仍可随时释放**。
+- **失败回滚**：任一份分配失败（真实 ENOSPC 或演练注入）即中止任务，删除本次
+  暂存目录、退回本次暂占的全部块；已有储备不受影响。
+- **重启恢复**：服务启动时清理 `staging/` 中尚未生效的补回；`ready/` 中已生效
+  的补回与历史释放随命名卷持久化，继续有效。所有操作追加记录到
+  `events.jsonl` 审计日志，网页可查。
+
+储备目录（默认 `$LOG_VOLUME/.duty-reserve`）布局：
+
+```
+.duty-reserve/
+├── lock                    单实例排他锁
+├── ready/b000001/p01 ...   已生效储备（一个目录 = 一次成功补回）
+├── staging/b000002.staging/  尚未生效的补回（重启即清理）
+└── events.jsonl            审计事件（release / replenish_done /
+                            replenish_failed / startup_cleanup）
+```
+
+网页操作：顶部"应急储备"面板展示已备份数、进度条、卷可用空间与在途补回任务；
+填份数点"申请补回"，或点"1 份 / 2 份 / 全部"释放；任务进行中页面自动轮询刷新。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/reserve` | 储备状态（份数、批次、在途任务、审计事件） |
+| POST | `/api/reserve/replenish` | `{count}` 申请补回 count 份，返回补回任务 |
+| POST | `/api/reserve/release` | `{count}` 释放 count 份（FIFO，超出存量时有多少放多少） |
+| GET | `/api/reserve/jobs/<id>` | 查询补回任务进度与结果 |
+
+相关环境变量：`RESERVE_ROOT`（储备目录）、`RESERVE_ALLOC_DELAY`（每份分配停顿
+秒数，便于演示）、`RESERVE_FAIL_AFTER_BLOCKS`（演练用：累计分配到该 st_blocks
+数后注入 ENOSPC，验证失败回滚；正常运行不设置）。
+
+### 测试
+
+```bash
+python3 -I tests/test_reserve.py            # 储备核心模块（8 项，无需 Flask）
+PYTHONPATH 指向 Flask 后：
+python3 -I tests/test_reserve_api.py        # HTTP 端到端（3 项）
+```
+
+覆盖：每份实占块复核、16 份上限与在途额度、FIFO 释放、**分配期间释放**、
+fallocate 不支持时降级、**分配失败整批回滚**、**重启清理未生效补回且保留已生效
+储备**、单实例锁（同进程注册表 + 跨进程 lockf）。
 
 ## 对宿主机使用
 

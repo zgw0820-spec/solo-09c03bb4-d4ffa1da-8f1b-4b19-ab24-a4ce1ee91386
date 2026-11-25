@@ -15,6 +15,15 @@ services:
     environment:
       LOG_VOLUME: /logs   # 只处理这一个专用日志卷
       PORT: 8080
+      # 应急储备：每份在日志卷上实占 8 MiB 数据块、最多 16 份，存放在卷内
+      # .duty-reserve（随命名卷持久化，服务重启后已生效储备继续有效）。
+      RESERVE_ROOT: /logs/.duty-reserve
+      # 每份分配后的停顿（秒），让网页上能看清“补回暂存→整批生效”的过程；
+      # 生产环境可调小或置 0，不影响正确性。
+      RESERVE_ALLOC_DELAY: "0.2"
+      # 故障演练用：累计分配到指定 st_blocks 数后注入 ENOSPC，演示补回失败回滚。
+      # 正常运行保持注释/不设置。
+      # RESERVE_FAIL_AFTER_BLOCKS: "32769"
     volumes:
       - logvol:/logs
     restart: unless-stopped

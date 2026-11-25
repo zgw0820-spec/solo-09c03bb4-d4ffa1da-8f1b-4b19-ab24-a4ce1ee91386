@@ -14,6 +14,7 @@ import time
 from flask import Flask, jsonify, render_template, request
 
 from planner import make_plan, reclaimable
+from reserve import MAX_PORTIONS, PORTION_BYTES, ReserveError, ReserveManager
 from scanner import take_snapshot
 
 LOG_VOLUME = os.environ.get("LOG_VOLUME", "/logs")
@@ -26,6 +27,20 @@ _plan_seq = itertools.count(1)
 _snapshots = {}  # snap_id -> snapshot
 _plans = {}      # plan_id -> plan
 _current_snap_id = None
+
+# 应急储备：根目录位于日志卷上，由本单进程服务管理
+RESERVE_ROOT = os.environ.get(
+    "RESERVE_ROOT", os.path.join(LOG_VOLUME, ".duty-reserve")
+)
+_reserve = ReserveManager(
+    RESERVE_ROOT,
+    alloc_delay=float(os.environ.get("RESERVE_ALLOC_DELAY", "0.1")),
+    fail_after_blocks=(
+        int(os.environ["RESERVE_FAIL_AFTER_BLOCKS"])
+        if os.environ.get("RESERVE_FAIL_AFTER_BLOCKS")
+        else None
+    ),
+)
 
 
 def _now():
@@ -226,6 +241,57 @@ def api_review():
         plan["review"] = review
         plans = _plans_list()
     return jsonify({"review": review, "snapshot": new_snap, "plans": plans})
+
+
+# ---------------- 应急储备 ----------------
+
+@app.get("/api/reserve")
+def api_reserve_status():
+    return jsonify(
+        {
+            "reserve": _reserve.status(),
+            "portion_bytes": PORTION_BYTES,
+            "max_portions": MAX_PORTIONS,
+            "events": _reserve.list_events(50),
+        }
+    )
+
+
+@app.post("/api/reserve/release")
+def api_reserve_release():
+    body = request.get_json(force=True, silent=True) or {}
+    raw = body.get("count", 1)
+    try:
+        count = int(raw)
+    except (TypeError, ValueError):
+        return _err("参数格式错误：count 必须是整数")
+    try:
+        result = _reserve.release(count)
+    except ReserveError as exc:
+        return _err(str(exc), 409)
+    return jsonify({"released": result, "reserve": _reserve.status()})
+
+
+@app.post("/api/reserve/replenish")
+def api_reserve_replenish():
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        count = int(body["count"])
+    except (KeyError, TypeError, ValueError):
+        return _err("参数格式错误：count 必须是整数")
+    try:
+        job = _reserve.replenish(count)
+    except ReserveError as exc:
+        return _err(str(exc), 409)
+    return jsonify({"job": job, "reserve": _reserve.status()})
+
+
+@app.get("/api/reserve/jobs/<job_id>")
+def api_reserve_job(job_id):
+    job = _reserve.get_job(job_id)
+    if job is None:
+        return _err("补回任务不存在", 404)
+    return jsonify({"job": job, "reserve": _reserve.status()})
 
 
 if __name__ == "__main__":
