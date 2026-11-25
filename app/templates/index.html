@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>日志卷回收值班台</title>
+<style>
+  :root { --bd:#d0d7de; --ok:#1a7f37; --bad:#cf222e; --muted:#57606a; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f6f8fa; color: #1f2328; }
+  header { background: #0d419d; color: #fff; padding: 14px 20px; }
+  header h1 { margin: 0 0 6px; font-size: 18px; }
+  header .vol { font-size: 13px; opacity: .92; }
+  main { max-width: 1080px; margin: 18px auto; padding: 0 16px; }
+  section { background: #fff; border: 1px solid var(--bd); border-radius: 8px;
+            padding: 14px 16px; margin-bottom: 16px; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid var(--bd); padding: 5px 8px; text-align: left; }
+  th { background: #f6f8fa; }
+  button { background: #1f6feb; color: #fff; border: 0; border-radius: 6px;
+           padding: 6px 14px; font-size: 13px; cursor: pointer; }
+  button:disabled { background: #9ec5fe; cursor: not-allowed; }
+  button.ghost { background: #eaeef2; color: #1f2328; }
+  input[type=number] { width: 90px; padding: 4px 6px; border: 1px solid var(--bd); border-radius: 6px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .ok { color: var(--ok); font-weight: 600; }
+  .bad { color: var(--bad); font-weight: 600; }
+  .bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .panel { border: 1px solid var(--bd); border-radius: 6px; padding: 10px 12px; margin-top: 10px; display: none; }
+  .panel.show { display: block; }
+  .panel.ok-panel { border-color: var(--ok); background: #f0fff4; }
+  .panel.bad-panel { border-color: var(--bad); background: #fff5f5; }
+  ul { margin: 6px 0; padding-left: 20px; }
+  code { background: #eff1f3; padding: 1px 4px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>日志卷回收值班台</h1>
+  <div class="vol" id="vol-info">尚未盘点</div>
+</header>
+<main>
+  <section>
+    <div class="bar">
+      <button id="btn-scan">盘点日志卷</button>
+      <span id="snap-info" class="muted"></span>
+    </div>
+    <h2>已删除但仍被占用的文件（按已分配磁盘块估算）</h2>
+    <table id="files">
+      <thead><tr><th>路径（已删除）</th><th>估算占用</th><th>持有进程组 PGID</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>持有进程组（勾选候选，最多 {{ max_groups }} 个）</h2>
+    <div class="bar">
+      <span>已选 <b id="sel-count">0</b>/{{ max_groups }}</span>
+      <span>目标腾出 <input id="target" type="number" min="1" step="1" value="45"> MiB</span>
+      <button id="btn-plan">生成方案</button>
+      <span class="muted">方案按当前这次盘点计算；文件须全部持有组都被勾选/重启才可回收</span>
+    </div>
+    <table id="groups">
+      <thead><tr><th></th><th>PGID</th><th>进程数</th><th>命令</th><th>持有文件数</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="panel" id="plan-result"></div>
+  </section>
+
+  <section>
+    <h2>方案列表</h2>
+    <table id="plans">
+      <thead><tr><th>方案</th><th>时间</th><th>重启组</th><th>预计释放</th><th>目标</th><th>状态</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="panel" id="review-result"></div>
+  </section>
+</main>
+
+<script>
+const MAX_GROUPS = {{ max_groups }};
+let snapshot = null, plans = [];
+const selected = new Set();
+
+function fmtMiB(b){ return (b/1048576).toFixed(1) + " MiB"; }
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function api(path, body){
+  const opt = {method: body === undefined ? 'GET' : 'POST', headers: {'Content-Type': 'application/json'}};
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+
+async function doScan(){
+  try {
+    const j = await api('/api/inventory', {});
+    snapshot = j.snapshot; plans = j.plans;
+    render();
+  } catch(e){ alert('盘点失败：' + e.message); }
+}
+
+async function load(){
+  try {
+    const j = await api('/api/state');
+    snapshot = j.snapshot; plans = j.plans;
+    render();
+  } catch(e){ alert('加载失败：' + e.message); }
+}
+
+async function doPlan(){
+  if (!snapshot){ alert('请先盘点'); return; }
+  const t = parseFloat(document.getElementById('target').value);
+  if (!(t > 0)){ alert('请填写要腾出的空间（MiB）'); return; }
+  if (selected.size === 0){ alert('请勾选至少 1 个进程组'); return; }
+  try {
+    const j = await api('/api/plan', {
+      snapshot_id: snapshot.id,
+      groups: [...selected],
+      target_bytes: Math.round(t * 1048576)
+    });
+    plans = j.plans;
+    showPlanResult(j, t);
+    render();
+  } catch(e){ alert('生成方案失败：' + e.message); }
+}
+
+async function doReview(planId){
+  try {
+    const j = await api('/api/review', {plan_id: planId});
+    snapshot = j.snapshot; plans = j.plans;
+    showReviewResult(j.review);
+    render();
+  } catch(e){ alert('复核失败：' + e.message); }
+}
+
+function showPlanResult(j, targetMiB){
+  const el = document.getElementById('plan-result');
+  if (j.feasible && j.plan){
+    const p = j.plan;
+    const files = p.files.map(f => `<li><code>${esc(f.path)}</code> — ${fmtMiB(f.bytes)}（持有组 ${f.holders.join(', ')}）</li>`).join('');
+    const groups = p.group_details.map(g => `<li>PGID <b>${g.pgid}</b>（${esc(g.names.join('/'))}，${g.pids.length} 个进程）</li>`).join('');
+    el.className = 'panel show ok-panel';
+    el.innerHTML = `<div class="ok">方案 ${p.id}：重启 ${p.groups.length} 个进程组即可达标</div>
+      <div>需重启：</div><ul>${groups}</ul>
+      <div>可回收文件（同一文件只计一次）：</div><ul>${files}</ul>
+      <div>预计释放 <b>${fmtMiB(p.bytes)}</b>（目标 ${fmtMiB(p.target_bytes)}）。复核前请勿变动这些进程。</div>`;
+  } else {
+    const files = (j.max_files || []).map(f => `<li><code>${esc(f.path)}</code> — ${fmtMiB(f.bytes)}</li>`).join('');
+    el.className = 'panel show bad-panel';
+    el.innerHTML = `<div class="bad">所选进程组全部重启也达不到目标 ${fmtMiB(Math.round(targetMiB*1048576))}</div>
+      <div>最多可腾出 <b>${fmtMiB(j.max_freeable)}</b>，对应文件：</div><ul>${files || '<li>无</li>'}</ul>`;
+  }
+}
+
+function showReviewResult(rv){
+  const el = document.getElementById('review-result');
+  const inv = rv.invalidations.map(s => `<li class="bad">${esc(s)}</li>`).join('');
+  const ntc = rv.notices.map(s => `<li class="muted">${esc(s)}</li>`).join('');
+  const opt = rv.new_optimal;
+  const optTxt = opt.feasible
+    ? `当前最优：${opt.groups.length} 组（${opt.groups.join(', ')}），可释放 ${fmtMiB(opt.bytes)}`
+    : `当前候选组最多可腾 ${fmtMiB(opt.max_freeable)}，不达标`;
+  el.className = 'panel show ' + (rv.valid ? 'ok-panel' : 'bad-panel');
+  el.innerHTML = `<div class="${rv.valid ? 'ok' : 'bad'}">${rv.valid ? '复核通过：方案仍有效' : '方案已作废'}</div>
+    <div class="muted">复核时间 ${esc(rv.checked_at)}，基于新盘点 ${esc(rv.snapshot_id)}；原方案按新盘点可回收 ${fmtMiB(rv.still_bytes)}</div>
+    ${inv ? '<div>作废原因：</div><ul>' + inv + '</ul>' : ''}
+    ${ntc ? '<div>其他变化：</div><ul>' + ntc + '</ul>' : ''}
+    <div class="muted">${esc(optTxt)}</div>`;
+}
+
+function render(){
+  const vol = document.getElementById('vol-info');
+  const si = document.getElementById('snap-info');
+  const ft = document.querySelector('#files tbody');
+  const gt = document.querySelector('#groups tbody');
+  if (!snapshot){
+    vol.textContent = '尚未盘点';
+    si.textContent = '';
+    ft.innerHTML = '<tr><td colspan="3" class="muted">点击“盘点日志卷”</td></tr>';
+    gt.innerHTML = '';
+  } else {
+    const v = snapshot.volume;
+    const totalBytes = snapshot.files.reduce((a, f) => a + f.bytes, 0);
+    vol.textContent = `日志卷 ${v.path}（挂载点 ${v.mountpoint}，设备 ${v.dev}）` +
+      `　容量 ${fmtMiB(v.total)}，已用 ${fmtMiB(v.used)}，可用 ${fmtMiB(v.free)}`;
+    si.textContent = `快照 ${snapshot.id} · ${snapshot.taken_at} · ${snapshot.files.length} 个已删除打开文件，共约 ${fmtMiB(totalBytes)}`;
+    ft.innerHTML = snapshot.files.map(f =>
+      `<tr><td><code>${esc(f.path)}</code></td><td>${fmtMiB(f.bytes)}</td><td>${f.holders.join(', ')}</td></tr>`
+    ).join('') || '<tr><td colspan="3" class="muted">没有发现已删除但仍被打开的文件</td></tr>';
+    const groups = Object.values(snapshot.groups);
+    gt.innerHTML = groups.map(g => {
+      const nfiles = snapshot.files.filter(f => f.holders.includes(g.pgid)).length;
+      const checked = selected.has(g.pgid) ? 'checked' : '';
+      return `<tr><td><input type="checkbox" data-pgid="${g.pgid}" ${checked}></td>
+        <td>${g.pgid}</td><td>${g.pids.length}</td>
+        <td><code>${esc(g.cmdline || g.names.join('/'))}</code></td><td>${nfiles}</td></tr>`;
+    }).join('') || '<tr><td colspan="5" class="muted">无持有进程组</td></tr>';
+    gt.querySelectorAll('input[type=checkbox]').forEach(cb => {
+      cb.addEventListener('change', onToggle);
+    });
+    updateSelCount();
+  }
+  const pt = document.querySelector('#plans tbody');
+  pt.innerHTML = plans.map(p => {
+    let st = '<span class="muted">未复核</span>';
+    if (p.review) st = p.review.valid ? '<span class="ok">复核有效</span>' : '<span class="bad">已作废</span>';
+    return `<tr><td>${p.id}</td><td>${esc(p.created_at)}</td><td>${p.groups.join(', ')}</td>
+      <td>${fmtMiB(p.bytes)}</td><td>${fmtMiB(p.target_bytes)}</td><td>${st}</td>
+      <td><button class="ghost" onclick="doReview('${p.id}')">复核</button></td></tr>`;
+  }).join('') || '<tr><td colspan="7" class="muted">还没有方案</td></tr>';
+}
+
+function onToggle(ev){
+  const pgid = parseInt(ev.target.dataset.pgid, 10);
+  if (ev.target.checked){
+    if (selected.size >= MAX_GROUPS){
+      ev.target.checked = false;
+      alert(`最多选择 ${MAX_GROUPS} 个进程组`);
+      return;
+    }
+    selected.add(pgid);
+  } else {
+    selected.delete(pgid);
+  }
+  updateSelCount();
+}
+
+function updateSelCount(){
+  document.getElementById('sel-count').textContent = selected.size;
+  document.querySelectorAll('#groups input[type=checkbox]').forEach(cb => {
+    const pgid = parseInt(cb.dataset.pgid, 10);
+    cb.disabled = !cb.checked && selected.size >= MAX_GROUPS;
+  });
+}
+
+document.getElementById('btn-scan').addEventListener('click', doScan);
+document.getElementById('btn-plan').addEventListener('click', doPlan);
+load();
+</script>
+</body>
+</html>

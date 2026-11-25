@@ -1,0 +1,31 @@
+# 日志卷回收值班台：盘点已删除但仍被打开的日志，给出重启组数最少的回收方案。
+#
+# 默认是自包含演示：容器内启动 5 个样例日志进程（4 个文件，其中 shared.log
+# 被两个进程组共同持有），日志写入命名卷 logvol（挂载点 /logs）。
+#
+#   docker compose up --build
+#   打开 http://localhost:8080
+#
+services:
+  duty-web:
+    build: .
+    image: logreclaim-duty-web
+    ports:
+      - "8080:8080"
+    environment:
+      LOG_VOLUME: /logs   # 只处理这一个专用日志卷
+      PORT: 8080
+    volumes:
+      - logvol:/logs
+    restart: unless-stopped
+
+  # —— 如需盘点宿主机上的真实采集机进程，可改用下面的方式 ——
+  # 1) 关掉样例进程：environment 里加 SAMPLES: "off"；
+  # 2) 共享宿主机进程命名空间，并把宿主机日志卷挂到相同路径：
+  #    pid: host
+  #    volumes:
+  #      - /var/log/my-collector:/logs:ro   # 宿主机专用日志卷的挂载点
+  # 注意：卷按“挂载点设备号”识别，挂进来的应是该卷真实的挂载点。
+
+volumes:
+  logvol:
